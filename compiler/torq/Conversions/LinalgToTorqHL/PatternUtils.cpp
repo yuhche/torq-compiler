@@ -4419,7 +4419,16 @@ static FailureOr<Value> pickGroupResultInt8(Value value, Operation *stopBefore =
         if (auto genericOp = dyn_cast<linalg::GenericOp>(consumer)) {
             if (hasNonEpilogueOtherInput(genericOp, value, filterShape))
                 return value;
+            if (!isFusedF32ClampTruncf(genericOp) && !isAdditiveFloatEpilogue(genericOp, value))
+                return value; // not foldable into the bias: keep it as its own op
             value = genericOp.getResult(0);
+            if (isFusedF32ClampTruncf(genericOp)) {
+                // A float ReLU/ReLU6/Clip ends the group: computeRescaleInfo folds it into the
+                // conv's output clamp. With --torq-convert-dtypes the clamp is bf16 -> bf16 with
+                // no truncf, so without this check the walk continued into it and createNewBias
+                // folded it into the bias: conv(x) + relu(b) instead of relu(conv(x) + b).
+                return value;
+            }
             for (auto &op : genericOp.getRegion().getOps()) {
                 if (isa<linalg::YieldOp>(op)) {
                     continue;
@@ -4441,6 +4450,62 @@ static FailureOr<Value> pickGroupResultInt8(Value value, Operation *stopBefore =
         }
     }
     return value;
+}
+
+static bool isFusedF32ClampTruncf(linalg::GenericOp op);
+
+// True if `generic` only adds constant epilogue terms to the walked value: in its body, every
+// op that reads the walked value is an addf with a value not derived from it, a subf with the
+// walked value on the left, an extf/truncf, or one of the existing maximumf/minimumf clamp
+// markers. Ops that combine only epilogue inputs (e.g. bias * scale) are fine: they do not
+// involve the anchor's output.
+//
+// createNewBias evaluates the group with the anchor's output set to zero and deletes it, which
+// is right only for `anchor + c`. Anything else that reads the anchor's output (a multiply, a
+// sigmoid, a select that is not a recognised clamp, c - x, x + x) would be evaluated at zero and
+// folded into the bias: conv(x) + f(b) instead of f(conv(x) + b). The walk stops before it.
+static bool isAdditiveFloatEpilogue(linalg::GenericOp generic, Value walked) {
+    if (generic->getNumResults() != 1)
+        return false;
+    llvm::SmallPtrSet<Value, 8> fromWalked;
+    for (OpOperand &operand : generic->getOpOperands())
+        if (operand.get() == walked)
+            fromWalked.insert(generic.getMatchingBlockArgument(&operand));
+    if (fromWalked.empty())
+        return false;
+    auto derived = [&](Value v) { return fromWalked.contains(v); };
+
+    Block &body = generic.getRegion().front();
+    for (Operation &op : body.without_terminator()) {
+        if (llvm::none_of(op.getOperands(), derived))
+            continue; // math on epilogue inputs only
+        if (isa<arith::ExtFOp, arith::TruncFOp, arith::MaximumFOp, arith::MinimumFOp>(op)) {
+            // casts, and the existing float clamp markers (the walk ends at them as before)
+        }
+        else if (auto add = dyn_cast<arith::AddFOp>(op)) {
+            if (derived(add.getLhs()) && derived(add.getRhs()))
+                return false; // x + x scales the anchor
+        }
+        else if (auto sub = dyn_cast<arith::SubFOp>(op)) {
+            if (derived(sub.getRhs()))
+                return false; // c - x negates the anchor
+        }
+        else {
+            return false;
+        }
+        fromWalked.insert(op.getResult(0));
+    }
+    auto yield = cast<linalg::YieldOp>(body.getTerminator());
+    return yield->getNumOperands() == 1 && derived(yield->getOperand(0));
+}
+
+// For the non-generic ops shouldInclude() admits: an elementwise named op (linalg.elementwise,
+// linalg.map, ...) ends the group, since its arithmetic is not inspected here; by this point the
+// pipeline has generalized elementwise ops, so this only costs a fusion in rare cases. Other ops
+// (transpose, fill, reductions) keep their existing handling.
+static bool isAdditiveFloatEpilogue(Operation *op) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+    return !linalgOp || !linalg::isElementwise(linalgOp);
 }
 
 static FailureOr<Value> pickGroupResultFloat(Value value, Operation *stopBefore = nullptr) {
@@ -4473,6 +4538,8 @@ static FailureOr<Value> pickGroupResultFloat(Value value, Operation *stopBefore 
             }
         }
         else if (shouldInclude(consumer)) {
+            if (!isAdditiveFloatEpilogue(consumer))
+                return value;
             value = consumer->getResult(0);
         }
         else {
@@ -4500,6 +4567,9 @@ computeGroup(Value value, Value groupResult, SmallVector<Operation *> &opsToGrou
 
 static bool isRescaleF32(Operation *op) {
     if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+        if (isFusedF32ClampTruncf(genericOp)) {
+            return true;
+        }
         for (auto &op : genericOp.getRegion().getOps()) {
             if (isa<arith::TruncFOp>(op) || isa<arith::MaximumFOp>(op) ||
                 isa<arith::MinimumFOp>(op)) {
@@ -5235,15 +5305,46 @@ static bool extractInt8RescaleBodyOps(
     return !!out.applyScaleOp;
 }
 
-/// Returns true if op is the fused f32-clamp-then-truncf linalg.generic:
-///   ins(%f32_tensor) outs(%bf16_tensor)
+/// Same-type float clamp: the body holds only cmpf(ugt/ult) against a constant and the
+/// select consuming it, at least one of them ugt. Anything else (a multiply, an exp, a
+/// two-tensor compare) is not a clamp and must not be folded into the conv.
+static bool isSameTypeFloatClamp(linalg::GenericOp op) {
+    bool hasCmpfUgt = false;
+    for (auto &bodyOp : op.getRegion().front().without_terminator()) {
+        if (auto cmp = dyn_cast<arith::CmpFOp>(bodyOp)) {
+            auto pred = cmp.getPredicate();
+            if (pred != arith::CmpFPredicate::UGT && pred != arith::CmpFPredicate::ULT)
+                return false;
+            if (!cmp.getRhs().getDefiningOp<arith::ConstantOp>())
+                return false;
+            hasCmpfUgt |= pred == arith::CmpFPredicate::UGT;
+        }
+        else if (auto sel = dyn_cast<arith::SelectOp>(bodyOp)) {
+            if (!sel.getCondition().getDefiningOp<arith::CmpFOp>())
+                return false;
+        }
+        else {
+            return false;
+        }
+    }
+    return hasCmpfUgt;
+}
+
+/// Returns true if op is a float clamp the conv output stage can apply:
+///   ins(%f32_tensor) outs(%bf16_tensor)          (model exported as bf16)
 ///   body: cmpf(ult) + select + cmpf(ugt) + select + truncf   (relu6)
 ///   body: cmpf(ugt) + select + truncf                        (simple ReLU)
+/// or the same clamp without the truncf, input and output of the same float type, as
+/// produced by --torq-convert-dtypes:
+///   ins(%bf16_tensor) outs(%bf16_tensor)
+///   body: [cmpf(ult) + select +] cmpf(ugt) + select
 static bool isFusedF32ClampTruncf(linalg::GenericOp op) {
     if (!op || op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1)
         return false;
     auto inputElemTy = dyn_cast<ShapedType>(op.getInputs()[0].getType()).getElementType();
     auto outputElemTy = dyn_cast<ShapedType>(op.getResultTypes()[0]).getElementType();
+    if (inputElemTy == outputElemTy && (inputElemTy.isBF16() || inputElemTy.isF32()))
+        return isSameTypeFloatClamp(op);
     if (!inputElemTy.isF32() || !outputElemTy.isBF16())
         return false;
     bool hasCmpfUgt = false, hasTruncf = false;
@@ -5295,10 +5396,13 @@ static bool extractF32ClampTruncfInfo(linalg::GenericOp op, ScaleClampInfo &scIn
         auto floatAttr = dyn_cast<FloatAttr>(boundConst.getValue());
         if (!floatAttr)
             continue;
-        // Store the IEEE 754 binary representation of the f32 value as int32.
-        // bitcastToAPInt() gives the raw bit pattern without any numeric conversion.
-        int32_t boundBits =
-            static_cast<int32_t>(floatAttr.getValue().bitcastToAPInt().getZExtValue());
+        // Store the IEEE 754 binary representation of the bound as an f32, as int32.
+        // With --torq-convert-dtypes the constant is bf16; widen it first (exact), otherwise
+        // its 16-bit pattern would be read as f32 bits (6.0 -> 0x40C0 -> a denormal).
+        APFloat bound = floatAttr.getValue();
+        bool losesInfo = false;
+        bound.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &losesInfo);
+        int32_t boundBits = static_cast<int32_t>(bound.bitcastToAPInt().getZExtValue());
 
         auto it = cmpToSelect.find(cmp.getResult());
         if (it == cmpToSelect.end())
